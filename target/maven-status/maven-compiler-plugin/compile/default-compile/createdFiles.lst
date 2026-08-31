@@ -1,1 +1,12 @@
+com\rediscone\RdbLoader.class
+com\rediscone\ClientSession.class
+com\rediscone\CommandHandler$CommandExecutor.class
+com\rediscone\CommandHandler.class
+com\rediscone\RespEncoder.class
+com\rediscone\ServerConfig.class
+com\rediscone\DataStore$StoreEntry.class
 com\rediscone\Main.class
+com\rediscone\RespParser.class
+com\rediscone\DataStore.class
+com\rediscone\RespDecoder.class
+com\rediscone\ReplicaClient.class

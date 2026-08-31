@@ -72,10 +72,10 @@ public class Main {
                     } else if (key.isWritable()) {
                         handleWrite(key);
                     }
-                } catch (IOException e) {
-                    System.err.println("Client error: " + e.getMessage());
-                    closeClient(key);
-                }
+                } } catch (Exception e) {
+    System.err.println("Client error: " + e.getMessage());
+    closeClient(key);
+}
             }
         }
     }
