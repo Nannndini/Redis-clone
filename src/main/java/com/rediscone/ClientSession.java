@@ -18,6 +18,10 @@ public class ClientSession {
     private final ByteBuffer readBuffer;
     private final Queue<ByteBuffer> writeQueue;
 
+    // Replication state
+    private boolean isReplica = false;
+    private volatile long acknowledgedOffset = 0;
+
     public ClientSession(SocketChannel channel) {
         this.channel = channel;
         this.decoder = new RespDecoder();
@@ -29,11 +33,6 @@ public class ClientSession {
         return channel;
     }
 
-    /**
-     * Read available data from the channel into the read buffer,
-     * then feed it to the RESP decoder.
-     * @return number of bytes read, or -1 if the client disconnected.
-     */
     public int read() throws IOException {
         readBuffer.clear();
         int bytesRead = channel.read(readBuffer);
@@ -44,31 +43,21 @@ public class ClientSession {
         return bytesRead;
     }
 
-    /**
-     * Try to decode the next complete RESP command from buffered data.
-     * @return parsed command, or null if more data is needed.
-     */
     public List<String> getNextCommand() {
         return decoder.decode();
     }
 
-    /**
-     * Queue a response to be written back to the client.
-     */
     public void queueResponse(byte[] data) {
-        writeQueue.add(ByteBuffer.wrap(data));
+        if (data != null && data.length > 0) {
+            writeQueue.add(ByteBuffer.wrap(data));
+        }
     }
 
-    /**
-     * Write queued data to the channel.
-     * @return true if all queued data has been written.
-     */
     public boolean doWrite() throws IOException {
         while (!writeQueue.isEmpty()) {
             ByteBuffer buf = writeQueue.peek();
             channel.write(buf);
             if (buf.hasRemaining()) {
-                // Socket buffer is full — try again later
                 return false;
             }
             writeQueue.poll();
@@ -76,10 +65,25 @@ public class ClientSession {
         return true;
     }
 
-    /**
-     * Check if there is data waiting to be written.
-     */
     public boolean hasDataToWrite() {
         return !writeQueue.isEmpty();
+    }
+
+    // ── Replication accessors ───────────────────────────────────────
+
+    public boolean isReplica() {
+        return isReplica;
+    }
+
+    public void setReplica(boolean replica) {
+        isReplica = replica;
+    }
+
+    public long getAcknowledgedOffset() {
+        return acknowledgedOffset;
+    }
+
+    public void setAcknowledgedOffset(long offset) {
+        this.acknowledgedOffset = offset;
     }
 }

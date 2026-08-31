@@ -32,6 +32,16 @@ public class Main {
             loader.load(config.getRdbPath());
         }
 
+        // Start replica handshake if configured as replica
+        if (config.isReplica()) {
+            ReplicaClient replicaClient = new ReplicaClient(
+                    config.getReplicaOfHost(), config.getReplicaOfPort(),
+                    port, dataStore, commandHandler);
+            Thread replicaThread = new Thread(replicaClient, "replica-client");
+            replicaThread.setDaemon(true);
+            replicaThread.start();
+        }
+
         ServerSocketChannel serverChannel = ServerSocketChannel.open();
         serverChannel.bind(new InetSocketAddress(port));
         serverChannel.configureBlocking(false);
