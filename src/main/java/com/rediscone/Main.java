@@ -18,11 +18,19 @@ public class Main {
 
     private static final int DEFAULT_PORT = 6379;
     private static CommandHandler commandHandler;
+    private static ServerConfig config;
 
     public static void main(String[] args) throws IOException {
-        int port = DEFAULT_PORT;
+        config = ServerConfig.parse(args);
+        int port = config.getPort();
         DataStore dataStore = new DataStore();
-        commandHandler = new CommandHandler(dataStore);
+        commandHandler = new CommandHandler(dataStore, config);
+
+        // Load RDB file if configured
+        if (config.getRdbPath() != null) {
+            RdbLoader loader = new RdbLoader(dataStore);
+            loader.load(config.getRdbPath());
+        }
 
         ServerSocketChannel serverChannel = ServerSocketChannel.open();
         serverChannel.bind(new InetSocketAddress(port));

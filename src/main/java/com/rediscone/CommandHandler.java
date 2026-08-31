@@ -1,8 +1,10 @@
 package com.rediscone;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Command dispatch table for the Redis clone server.
@@ -20,9 +22,11 @@ public class CommandHandler {
 
     private final Map<String, CommandExecutor> commands = new HashMap<>();
     private final DataStore dataStore;
+    private final ServerConfig config;
 
-    public CommandHandler(DataStore dataStore) {
+    public CommandHandler(DataStore dataStore, ServerConfig config) {
         this.dataStore = dataStore;
+        this.config = config;
         registerCoreCommands();
     }
 
@@ -110,6 +114,49 @@ public class CommandHandler {
                 return RespEncoder.nullBulkString();
             }
             return RespEncoder.bulkString(value);
+        });
+
+        // CONFIG GET <parameter>
+        registerCommand("CONFIG", (args, session) -> {
+            if (args.size() < 3) {
+                return RespEncoder.error("wrong number of arguments for 'config' command");
+            }
+            String subCommand = args.get(1).toUpperCase();
+            if ("GET".equals(subCommand)) {
+                String param = args.get(2).toLowerCase();
+                switch (param) {
+                    case "dir":
+                        return RespEncoder.array(List.of("dir",
+                                config.getDir() != null ? config.getDir() : ""));
+                    case "dbfilename":
+                        return RespEncoder.array(List.of("dbfilename",
+                                config.getDbFilename() != null ? config.getDbFilename() : ""));
+                    default:
+                        return RespEncoder.emptyArray();
+                }
+            }
+            return RespEncoder.error("unsupported CONFIG subcommand '" + args.get(1) + "'");
+        });
+
+        // KEYS <pattern>
+        registerCommand("KEYS", (args, session) -> {
+            if (args.size() < 2) {
+                return RespEncoder.error("wrong number of arguments for 'keys' command");
+            }
+            String pattern = args.get(1);
+            Set<String> keys = dataStore.keys();
+            if ("*".equals(pattern)) {
+                return RespEncoder.array(new ArrayList<>(keys));
+            }
+            // Simple pattern matching — only support * wildcard for now
+            List<String> matched = new ArrayList<>();
+            String regex = pattern.replace("*", ".*");
+            for (String key : keys) {
+                if (key.matches(regex)) {
+                    matched.add(key);
+                }
+            }
+            return RespEncoder.array(matched);
         });
     }
 }
