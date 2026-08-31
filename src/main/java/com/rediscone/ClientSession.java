@@ -2,14 +2,17 @@ package com.rediscone;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 
 /**
  * Per-client connection state, attached to a SelectionKey in the NIO event loop.
- * Manages read buffering, RESP decoding, and write queuing for a single client.
+ * Manages read buffering, RESP decoding, write queuing, and transaction state
+ * for a single client.
  */
 public class ClientSession {
 
@@ -21,6 +24,13 @@ public class ClientSession {
     // Replication state
     private boolean isReplica = false;
     private volatile long acknowledgedOffset = 0;
+
+    // NIO key for triggering OP_WRITE from deferred responses (e.g. WAIT)
+    private SelectionKey selectionKey;
+
+    // Transaction state (MULTI/EXEC/DISCARD)
+    private boolean inTransaction = false;
+    private List<List<String>> transactionQueue = new ArrayList<>();
 
     public ClientSession(SocketChannel channel) {
         this.channel = channel;
@@ -69,6 +79,16 @@ public class ClientSession {
         return !writeQueue.isEmpty();
     }
 
+    // ── SelectionKey accessor ────────────────────────────────────────
+
+    public SelectionKey getSelectionKey() {
+        return selectionKey;
+    }
+
+    public void setSelectionKey(SelectionKey key) {
+        this.selectionKey = key;
+    }
+
     // ── Replication accessors ───────────────────────────────────────
 
     public boolean isReplica() {
@@ -85,5 +105,44 @@ public class ClientSession {
 
     public void setAcknowledgedOffset(long offset) {
         this.acknowledgedOffset = offset;
+    }
+
+    // ── Transaction methods (MULTI/EXEC/DISCARD) ────────────────────
+
+    public boolean isInTransaction() {
+        return inTransaction;
+    }
+
+    /**
+     * Begin a transaction. Subsequent commands will be queued.
+     */
+    public void startTransaction() {
+        inTransaction = true;
+        transactionQueue.clear();
+    }
+
+    /**
+     * Queue a command for deferred execution within a transaction.
+     */
+    public void queueCommand(List<String> command) {
+        transactionQueue.add(command);
+    }
+
+    /**
+     * Execute a transaction: return all queued commands and reset state.
+     */
+    public List<List<String>> executeTransaction() {
+        List<List<String>> commands = new ArrayList<>(transactionQueue);
+        transactionQueue.clear();
+        inTransaction = false;
+        return commands;
+    }
+
+    /**
+     * Discard a transaction: clear the queue and exit transaction mode.
+     */
+    public void discardTransaction() {
+        transactionQueue.clear();
+        inTransaction = false;
     }
 }

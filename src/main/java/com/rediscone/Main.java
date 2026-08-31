@@ -53,7 +53,14 @@ public class Main {
 
         // Main event loop
         while (true) {
-            selector.select();
+            // Use short timeout when WAIT commands are pending, so we
+            // can process incoming REPLCONF ACK replies and check deadlines.
+            // Otherwise block until an IO event arrives.
+            if (commandHandler.hasPendingWaits()) {
+                selector.select(50);
+            } else {
+                selector.select();
+            }
 
             Iterator<SelectionKey> keyIterator = selector.selectedKeys().iterator();
             while (keyIterator.hasNext()) {
@@ -72,11 +79,15 @@ public class Main {
                     } else if (key.isWritable()) {
                         handleWrite(key);
                     }
-                } } catch (Exception e) {
-    System.err.println("Client error: " + e.getMessage());
-    closeClient(key);
-}
+                } catch (Exception e) {
+                    System.err.println("Client error: " + e.getMessage());
+                    closeClient(key);
+                }
             }
+
+            // Resolve any pending WAIT commands whose target replica
+            // count is met or whose deadline has passed.
+            commandHandler.processPendingWaits();
         }
     }
 
@@ -92,7 +103,8 @@ public class Main {
         clientChannel.configureBlocking(false);
 
         ClientSession session = new ClientSession(clientChannel);
-        clientChannel.register(selector, SelectionKey.OP_READ, session);
+        SelectionKey clientKey = clientChannel.register(selector, SelectionKey.OP_READ, session);
+        session.setSelectionKey(clientKey);
 
         System.out.println("Client connected: " + clientChannel.getRemoteAddress());
     }

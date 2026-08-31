@@ -3,6 +3,7 @@ package com.rediscone;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -28,6 +29,7 @@ public class CommandHandler {
     private final List<ClientSession> replicas = new CopyOnWriteArrayList<>();
     private final String masterReplId;
     private long masterReplOffset = 0;
+    private final List<PendingWait> pendingWaits = new ArrayList<>();
 
     // Write commands that get propagated to replicas
     private static final Set<String> WRITE_COMMANDS = Set.of("SET", "DEL", "EXPIRE", "PEXPIRE");
@@ -38,10 +40,16 @@ public class CommandHandler {
         this.masterReplId = generateReplId();
         registerCoreCommands();
         registerReplicationCommands();
+        registerTransactionCommands();
     }
+
+    // Transaction-aware commands that are never queued
+    private static final Set<String> TRANSACTION_COMMANDS = Set.of("MULTI", "EXEC", "DISCARD");
 
     /**
      * Dispatch a parsed command to the appropriate handler.
+     * When a session is inside a MULTI block, commands are queued instead
+     * of executed (except MULTI, EXEC, and DISCARD themselves).
      */
     public byte[] dispatch(List<String> command, ClientSession session) {
         if (command == null || command.isEmpty()) {
@@ -49,6 +57,20 @@ public class CommandHandler {
         }
 
         String name = command.get(0).toUpperCase();
+
+        // Transaction interception: queue commands inside a MULTI block
+        if (session != null && session.isInTransaction() && !TRANSACTION_COMMANDS.contains(name)) {
+            CommandExecutor executor = commands.get(name);
+            if (executor == null) {
+                // Queue even unknown commands — they'll error at EXEC time
+                // (Real Redis queues them and returns ERR on EXEC for each)
+                session.queueCommand(command);
+                return RespEncoder.simpleString("QUEUED");
+            }
+            session.queueCommand(command);
+            return RespEncoder.simpleString("QUEUED");
+        }
+
         CommandExecutor executor = commands.get(name);
 
         if (executor == null) {
@@ -283,7 +305,7 @@ public class CommandHandler {
             return out.toByteArray();
         });
 
-        // WAIT <numreplicas> <timeout>
+        // WAIT <numreplicas> <timeout> — non-blocking deferred response
         registerCommand("WAIT", (args, session) -> {
             if (args.size() < 3) {
                 return RespEncoder.error("wrong number of arguments for 'wait' command");
@@ -297,9 +319,12 @@ public class CommandHandler {
                 return RespEncoder.integer(replicas.size());
             }
 
+            // Capture the offset that replicas must acknowledge
+            long targetOffset = masterReplOffset;
+
             // Send REPLCONF GETACK * to all replicas
             byte[] getack = RespEncoder.command("REPLCONF", "GETACK", "*");
-            long getackBytes = getack.length;
+            masterReplOffset += getack.length;
 
             for (ClientSession replica : replicas) {
                 try {
@@ -309,40 +334,132 @@ public class CommandHandler {
                 }
             }
 
-            // Wait for ACKs (blocking in the event loop — simplified implementation)
-            long deadline = System.currentTimeMillis() + timeoutMs;
+            // Check if enough replicas have already acknowledged
             int ackedCount = 0;
-
-            while (System.currentTimeMillis() < deadline) {
-                ackedCount = 0;
-                for (ClientSession replica : replicas) {
-                    if (replica.getAcknowledgedOffset() >= masterReplOffset) {
-                        ackedCount++;
-                    }
-                }
-                if (ackedCount >= numReplicas) {
-                    break;
-                }
-                try {
-                    Thread.sleep(10); // Small polling interval
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
+            for (ClientSession replica : replicas) {
+                if (replica.getAcknowledgedOffset() >= targetOffset) {
+                    ackedCount++;
                 }
             }
+            if (ackedCount >= numReplicas) {
+                return RespEncoder.integer(ackedCount);
+            }
 
-            // Final count
-            ackedCount = 0;
+            // Defer: register a pending wait for the event loop to resolve
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            pendingWaits.add(new PendingWait(session, numReplicas, deadline, targetOffset));
+            return new byte[0]; // No immediate response — resolved by processPendingWaits()
+        });
+    }
+
+    private void registerTransactionCommands() {
+        // MULTI — start a transaction
+        registerCommand("MULTI", (args, session) -> {
+            if (session == null) {
+                return RespEncoder.error("MULTI is not allowed in this context");
+            }
+            if (session.isInTransaction()) {
+                return RespEncoder.error("MULTI calls can not be nested");
+            }
+            session.startTransaction();
+            return RespEncoder.simpleString("OK");
+        });
+
+        // EXEC — execute all queued commands atomically
+        registerCommand("EXEC", (args, session) -> {
+            if (session == null || !session.isInTransaction()) {
+                return RespEncoder.error("EXEC without MULTI");
+            }
+            List<List<String>> queued = session.executeTransaction();
+            List<byte[]> results = new ArrayList<>();
+            for (List<String> cmd : queued) {
+                String cmdName = cmd.get(0).toUpperCase();
+                CommandExecutor exec = commands.get(cmdName);
+                if (exec == null) {
+                    results.add(RespEncoder.error("unknown command '" + cmd.get(0) + "'"));
+                } else {
+                    byte[] result = exec.execute(cmd, session);
+                    results.add(result);
+                    // Propagate write commands to replicas
+                    if (!config.isReplica() && WRITE_COMMANDS.contains(cmdName) && !replicas.isEmpty()) {
+                        propagateToReplicas(cmd);
+                    }
+                }
+            }
+            return RespEncoder.arrayOfEncoded(results);
+        });
+
+        // DISCARD — discard all queued commands
+        registerCommand("DISCARD", (args, session) -> {
+            if (session == null || !session.isInTransaction()) {
+                return RespEncoder.error("DISCARD without MULTI");
+            }
+            session.discardTransaction();
+            return RespEncoder.simpleString("OK");
+        });
+    }
+
+    // ── Pending WAIT infrastructure ─────────────────────────────────────
+
+    /**
+     * Tracks a deferred WAIT command awaiting replica acknowledgements.
+     */
+    private static class PendingWait {
+        final ClientSession session;
+        final int targetReplicas;
+        final long deadline;
+        final long targetOffset;
+
+        PendingWait(ClientSession session, int targetReplicas, long deadline, long targetOffset) {
+            this.session = session;
+            this.targetReplicas = targetReplicas;
+            this.deadline = deadline;
+            this.targetOffset = targetOffset;
+        }
+    }
+
+    /**
+     * Returns true if there are WAIT commands pending resolution.
+     * Used by the event loop to decide on select() timeout.
+     */
+    public boolean hasPendingWaits() {
+        return !pendingWaits.isEmpty();
+    }
+
+    /**
+     * Check all pending WAIT commands and resolve any that have met their
+     * target replica count or exceeded their deadline. Called once per
+     * event loop iteration from Main, after processing selected keys.
+     */
+    public void processPendingWaits() {
+        if (pendingWaits.isEmpty()) {
+            return;
+        }
+
+        Iterator<PendingWait> it = pendingWaits.iterator();
+        while (it.hasNext()) {
+            PendingWait pw = it.next();
+
+            int ackedCount = 0;
             for (ClientSession replica : replicas) {
-                if (replica.getAcknowledgedOffset() >= masterReplOffset) {
+                if (replica.getAcknowledgedOffset() >= pw.targetOffset) {
                     ackedCount++;
                 }
             }
 
-            // Update offset to account for GETACK command sent
-            masterReplOffset += getackBytes;
+            if (ackedCount >= pw.targetReplicas || System.currentTimeMillis() >= pw.deadline) {
+                // Resolve: queue the integer response on the waiting client's session
+                byte[] response = RespEncoder.integer(ackedCount);
+                pw.session.queueResponse(response);
 
-            return RespEncoder.integer(ackedCount);
-        });
+                // Signal the selector to flush the queued response
+                SelectionKey key = pw.session.getSelectionKey();
+                if (key != null && key.isValid()) {
+                    key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+                }
+
+                it.remove();
+            }
+        }
     }
 }
