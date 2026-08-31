@@ -1,22 +1,130 @@
 package com.rediscone;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.net.InetSocketAddress;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.Iterator;
+import java.util.List;
 
+/**
+ * Redis clone server entry point.
+ * Uses a single-threaded NIO Selector event loop, mirroring Redis's actual
+ * single-threaded architecture for maximum correctness and performance.
+ */
 public class Main {
+
+    private static final int DEFAULT_PORT = 6379;
+
     public static void main(String[] args) throws IOException {
-        ServerSocket server = new ServerSocket(6379);
-        System.out.println("listening on 6379");
-        Socket client = server.accept();
-        InputStream in = client.getInputStream();
-        OutputStream out = client.getOutputStream();
-        byte[] buffer = new byte[1024];
-        int len;
-        while ((len = in.read(buffer)) != -1) {
-            out.write(buffer, 0, len);
+        int port = DEFAULT_PORT;
+
+        ServerSocketChannel serverChannel = ServerSocketChannel.open();
+        serverChannel.bind(new InetSocketAddress(port));
+        serverChannel.configureBlocking(false);
+
+        Selector selector = Selector.open();
+        serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+
+        System.out.println("Redis clone listening on port " + port);
+
+        // Main event loop
+        while (true) {
+            selector.select();
+
+            Iterator<SelectionKey> keyIterator = selector.selectedKeys().iterator();
+            while (keyIterator.hasNext()) {
+                SelectionKey key = keyIterator.next();
+                keyIterator.remove();
+
+                if (!key.isValid()) {
+                    continue;
+                }
+
+                try {
+                    if (key.isAcceptable()) {
+                        handleAccept(serverChannel, selector);
+                    } else if (key.isReadable()) {
+                        handleRead(key);
+                    } else if (key.isWritable()) {
+                        handleWrite(key);
+                    }
+                } catch (IOException e) {
+                    System.err.println("Client error: " + e.getMessage());
+                    closeClient(key);
+                }
+            }
+        }
+    }
+
+    /**
+     * Accept a new client connection and register it with the selector.
+     */
+    private static void handleAccept(ServerSocketChannel serverChannel, Selector selector)
+            throws IOException {
+        SocketChannel clientChannel = serverChannel.accept();
+        if (clientChannel == null) {
+            return;
+        }
+        clientChannel.configureBlocking(false);
+
+        ClientSession session = new ClientSession(clientChannel);
+        clientChannel.register(selector, SelectionKey.OP_READ, session);
+
+        System.out.println("Client connected: " + clientChannel.getRemoteAddress());
+    }
+
+    /**
+     * Handle readable event: read data, parse RESP commands, send responses.
+     */
+    private static void handleRead(SelectionKey key) throws IOException {
+        ClientSession session = (ClientSession) key.attachment();
+
+        int bytesRead = session.read();
+        if (bytesRead == -1) {
+            // Client disconnected
+            System.out.println("Client disconnected: " + session.getChannel().getRemoteAddress());
+            closeClient(key);
+            return;
+        }
+
+        // Process all complete commands available in the buffer
+        List<String> command;
+        while ((command = session.getNextCommand()) != null) {
+            // Temporary: respond +PONG to everything (real dispatch comes in Stage 3)
+            byte[] response = RespEncoder.simpleString("PONG");
+            session.queueResponse(response);
+        }
+
+        // If we have data to write, register interest in OP_WRITE
+        if (session.hasDataToWrite()) {
+            key.interestOps(SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+        }
+    }
+
+    /**
+     * Handle writable event: flush queued responses to the client.
+     */
+    private static void handleWrite(SelectionKey key) throws IOException {
+        ClientSession session = (ClientSession) key.attachment();
+
+        if (session.doWrite()) {
+            // All data written — stop watching for OP_WRITE
+            key.interestOps(SelectionKey.OP_READ);
+        }
+    }
+
+    /**
+     * Clean up a client connection.
+     */
+    private static void closeClient(SelectionKey key) {
+        try {
+            key.cancel();
+            key.channel().close();
+        } catch (IOException e) {
+            // Ignore close errors
         }
     }
 }
