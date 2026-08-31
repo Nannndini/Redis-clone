@@ -21,7 +21,8 @@ public class Main {
 
     public static void main(String[] args) throws IOException {
         int port = DEFAULT_PORT;
-        commandHandler = new CommandHandler();
+        DataStore dataStore = new DataStore();
+        commandHandler = new CommandHandler(dataStore);
 
         ServerSocketChannel serverChannel = ServerSocketChannel.open();
         serverChannel.bind(new InetSocketAddress(port));

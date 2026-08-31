@@ -19,8 +19,10 @@ public class CommandHandler {
     }
 
     private final Map<String, CommandExecutor> commands = new HashMap<>();
+    private final DataStore dataStore;
 
-    public CommandHandler() {
+    public CommandHandler(DataStore dataStore) {
+        this.dataStore = dataStore;
         registerCoreCommands();
     }
 
@@ -70,6 +72,44 @@ public class CommandHandler {
                 return RespEncoder.error("wrong number of arguments for 'echo' command");
             }
             return RespEncoder.bulkString(args.get(1));
+        });
+
+        // SET key value [PX ms] [EX seconds]
+        registerCommand("SET", (args, session) -> {
+            if (args.size() < 3) {
+                return RespEncoder.error("wrong number of arguments for 'set' command");
+            }
+            String key = args.get(1);
+            String value = args.get(2);
+            long expiryMs = -1;
+
+            // Parse optional PX/EX arguments
+            for (int i = 3; i < args.size() - 1; i++) {
+                String option = args.get(i).toUpperCase();
+                String optionValue = args.get(i + 1);
+                if ("PX".equals(option)) {
+                    expiryMs = Long.parseLong(optionValue);
+                    i++;
+                } else if ("EX".equals(option)) {
+                    expiryMs = Long.parseLong(optionValue) * 1000;
+                    i++;
+                }
+            }
+
+            dataStore.set(key, value, expiryMs);
+            return RespEncoder.simpleString("OK");
+        });
+
+        // GET key
+        registerCommand("GET", (args, session) -> {
+            if (args.size() < 2) {
+                return RespEncoder.error("wrong number of arguments for 'get' command");
+            }
+            String value = dataStore.get(args.get(1));
+            if (value == null) {
+                return RespEncoder.nullBulkString();
+            }
+            return RespEncoder.bulkString(value);
         });
     }
 }
