@@ -17,9 +17,11 @@ import java.util.List;
 public class Main {
 
     private static final int DEFAULT_PORT = 6379;
+    private static CommandHandler commandHandler;
 
     public static void main(String[] args) throws IOException {
         int port = DEFAULT_PORT;
+        commandHandler = new CommandHandler();
 
         ServerSocketChannel serverChannel = ServerSocketChannel.open();
         serverChannel.bind(new InetSocketAddress(port));
@@ -93,8 +95,7 @@ public class Main {
         // Process all complete commands available in the buffer
         List<String> command;
         while ((command = session.getNextCommand()) != null) {
-            // Temporary: respond +PONG to everything (real dispatch comes in Stage 3)
-            byte[] response = RespEncoder.simpleString("PONG");
+            byte[] response = commandHandler.dispatch(command, session);
             session.queueResponse(response);
         }
 
