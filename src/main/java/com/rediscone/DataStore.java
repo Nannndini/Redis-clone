@@ -88,4 +88,97 @@ public class DataStore {
     public void setWithAbsoluteExpiry(String key, String value, long expiresAtMs) {
         store.put(key, new StoreEntry(value, expiresAtMs));
     }
+
+    // ── List operations ─────────────────────────────────────────────────
+
+    private final ConcurrentHashMap<String, java.util.LinkedList<String>> lists = new ConcurrentHashMap<>();
+
+    /**
+     * Push one or more values onto the head (left) of a list.
+     * Creates the list if it doesn't exist.
+     * @return the length of the list after the push.
+     */
+    public int lpush(String key, String... values) {
+        lists.computeIfAbsent(key, k -> new java.util.LinkedList<>());
+        java.util.LinkedList<String> list = lists.get(key);
+        for (String v : values) {
+            list.addFirst(v);
+        }
+        return list.size();
+    }
+
+    /**
+     * Push one or more values onto the tail (right) of a list.
+     * Creates the list if it doesn't exist.
+     * @return the length of the list after the push.
+     */
+    public int rpush(String key, String... values) {
+        lists.computeIfAbsent(key, k -> new java.util.LinkedList<>());
+        java.util.LinkedList<String> list = lists.get(key);
+        for (String v : values) {
+            list.addLast(v);
+        }
+        return list.size();
+    }
+
+    /**
+     * Pop a value from the head (left) of a list.
+     * Removes the list if it becomes empty.
+     * @return the popped value, or null if the list doesn't exist or is empty.
+     */
+    public String lpop(String key) {
+        java.util.LinkedList<String> list = lists.get(key);
+        if (list == null || list.isEmpty()) {
+            return null;
+        }
+        String value = list.removeFirst();
+        if (list.isEmpty()) {
+            lists.remove(key);
+        }
+        return value;
+    }
+
+    /**
+     * Get a subrange of elements from a list.
+     * Negative indices count from the end (-1 = last element).
+     * @return list of elements in the range, or empty list if key doesn't exist.
+     */
+    public java.util.List<String> lrange(String key, int start, int stop) {
+        java.util.LinkedList<String> list = lists.get(key);
+        if (list == null || list.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        int size = list.size();
+
+        // Normalize negative indices
+        if (start < 0) start = size + start;
+        if (stop < 0) stop = size + stop;
+
+        // Clamp to valid range
+        if (start < 0) start = 0;
+        if (stop >= size) stop = size - 1;
+
+        if (start > stop || start >= size) {
+            return java.util.Collections.emptyList();
+        }
+
+        return new java.util.ArrayList<>(list.subList(start, stop + 1));
+    }
+
+    /**
+     * Get the length of a list.
+     * @return length, or 0 if the key doesn't exist.
+     */
+    public int llen(String key) {
+        java.util.LinkedList<String> list = lists.get(key);
+        return (list == null) ? 0 : list.size();
+    }
+
+    /**
+     * Check if a list key exists and is non-empty.
+     */
+    public boolean listExists(String key) {
+        java.util.LinkedList<String> list = lists.get(key);
+        return list != null && !list.isEmpty();
+    }
 }

@@ -53,10 +53,10 @@ public class Main {
 
         // Main event loop
         while (true) {
-            // Use short timeout when WAIT commands are pending, so we
-            // can process incoming REPLCONF ACK replies and check deadlines.
+            // Use short timeout when WAIT or BLPOP commands are pending, so we
+            // can check deadlines and data availability without blocking.
             // Otherwise block until an IO event arrives.
-            if (commandHandler.hasPendingWaits()) {
+            if (commandHandler.hasPendingWaits() || commandHandler.hasPendingBlocks()) {
                 selector.select(50);
             } else {
                 selector.select();
@@ -85,9 +85,9 @@ public class Main {
                 }
             }
 
-            // Resolve any pending WAIT commands whose target replica
-            // count is met or whose deadline has passed.
+            // Resolve any pending deferred commands
             commandHandler.processPendingWaits();
+            commandHandler.processPendingBlocks();
         }
     }
 

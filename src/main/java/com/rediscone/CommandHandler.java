@@ -30,9 +30,11 @@ public class CommandHandler {
     private final String masterReplId;
     private long masterReplOffset = 0;
     private final List<PendingWait> pendingWaits = new ArrayList<>();
+    private final List<PendingBlock> pendingBlocks = new ArrayList<>();
 
     // Write commands that get propagated to replicas
-    private static final Set<String> WRITE_COMMANDS = Set.of("SET", "DEL", "EXPIRE", "PEXPIRE");
+    private static final Set<String> WRITE_COMMANDS = Set.of(
+            "SET", "DEL", "EXPIRE", "PEXPIRE", "LPUSH", "RPUSH");
 
     public CommandHandler(DataStore dataStore, ServerConfig config) {
         this.dataStore = dataStore;
@@ -41,6 +43,7 @@ public class CommandHandler {
         registerCoreCommands();
         registerReplicationCommands();
         registerTransactionCommands();
+        registerListCommands();
     }
 
     // Transaction-aware commands that are never queued
@@ -461,5 +464,201 @@ public class CommandHandler {
                 it.remove();
             }
         }
+    }
+
+    // ── Pending BLPOP infrastructure ────────────────────────────────────
+
+    /**
+     * Tracks a deferred BLPOP command waiting for data on one or more keys.
+     */
+    private static class PendingBlock {
+        final ClientSession session;
+        final List<String> keys;
+        final long deadline; // epoch millis, 0 = wait forever
+
+        PendingBlock(ClientSession session, List<String> keys, long deadline) {
+            this.session = session;
+            this.keys = keys;
+            this.deadline = deadline;
+        }
+    }
+
+    /**
+     * Returns true if there are BLPOP commands pending resolution.
+     * Used by the event loop to decide on select() timeout.
+     */
+    public boolean hasPendingBlocks() {
+        return !pendingBlocks.isEmpty();
+    }
+
+    /**
+     * Check all pending BLPOP commands. Resolve any whose key now has data,
+     * or whose deadline has passed (respond with null bulk string array).
+     * Called once per event loop iteration from Main.
+     */
+    public void processPendingBlocks() {
+        if (pendingBlocks.isEmpty()) {
+            return;
+        }
+
+        Iterator<PendingBlock> it = pendingBlocks.iterator();
+        while (it.hasNext()) {
+            PendingBlock pb = it.next();
+
+            // Try each key in order — first non-empty key wins (Redis semantics)
+            boolean resolved = false;
+            for (String key : pb.keys) {
+                if (dataStore.listExists(key)) {
+                    String value = dataStore.lpop(key);
+                    if (value != null) {
+                        // BLPOP response is a 2-element array: [key, value]
+                        byte[] response = RespEncoder.array(List.of(key, value));
+                        pb.session.queueResponse(response);
+
+                        SelectionKey selKey = pb.session.getSelectionKey();
+                        if (selKey != null && selKey.isValid()) {
+                            selKey.interestOps(selKey.interestOps() | SelectionKey.OP_WRITE);
+                        }
+
+                        it.remove();
+                        resolved = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!resolved && pb.deadline > 0 && System.currentTimeMillis() >= pb.deadline) {
+                // Timeout — respond with null array
+                pb.session.queueResponse(RespEncoder.nullBulkString());
+
+                SelectionKey selKey = pb.session.getSelectionKey();
+                if (selKey != null && selKey.isValid()) {
+                    selKey.interestOps(selKey.interestOps() | SelectionKey.OP_WRITE);
+                }
+
+                it.remove();
+            }
+        }
+    }
+
+    /**
+     * Called by LPUSH/RPUSH handlers to immediately wake up any BLPOP
+     * clients waiting on the given key, without waiting for the next
+     * processPendingBlocks() tick.
+     */
+    private void resolveBlockedClientsForKey(String key) {
+        Iterator<PendingBlock> it = pendingBlocks.iterator();
+        while (it.hasNext()) {
+            PendingBlock pb = it.next();
+            if (pb.keys.contains(key) && dataStore.listExists(key)) {
+                String value = dataStore.lpop(key);
+                if (value != null) {
+                    byte[] response = RespEncoder.array(List.of(key, value));
+                    pb.session.queueResponse(response);
+
+                    SelectionKey selKey = pb.session.getSelectionKey();
+                    if (selKey != null && selKey.isValid()) {
+                        selKey.interestOps(selKey.interestOps() | SelectionKey.OP_WRITE);
+                    }
+
+                    it.remove();
+                    break; // Only wake the first waiting client (FIFO)
+                }
+            }
+        }
+    }
+
+    // ── List commands ───────────────────────────────────────────────────
+
+    private void registerListCommands() {
+        // LPUSH key value [value ...]
+        registerCommand("LPUSH", (args, session) -> {
+            if (args.size() < 3) {
+                return RespEncoder.error("wrong number of arguments for 'lpush' command");
+            }
+            String key = args.get(1);
+            String[] values = args.subList(2, args.size()).toArray(new String[0]);
+            int newLen = dataStore.lpush(key, values);
+
+            // Wake up any BLPOP clients waiting on this key
+            resolveBlockedClientsForKey(key);
+
+            return RespEncoder.integer(newLen);
+        });
+
+        // RPUSH key value [value ...]
+        registerCommand("RPUSH", (args, session) -> {
+            if (args.size() < 3) {
+                return RespEncoder.error("wrong number of arguments for 'rpush' command");
+            }
+            String key = args.get(1);
+            String[] values = args.subList(2, args.size()).toArray(new String[0]);
+            int newLen = dataStore.rpush(key, values);
+
+            // Wake up any BLPOP clients waiting on this key
+            resolveBlockedClientsForKey(key);
+
+            return RespEncoder.integer(newLen);
+        });
+
+        // LPOP key
+        registerCommand("LPOP", (args, session) -> {
+            if (args.size() < 2) {
+                return RespEncoder.error("wrong number of arguments for 'lpop' command");
+            }
+            String value = dataStore.lpop(args.get(1));
+            if (value == null) {
+                return RespEncoder.nullBulkString();
+            }
+            return RespEncoder.bulkString(value);
+        });
+
+        // LRANGE key start stop
+        registerCommand("LRANGE", (args, session) -> {
+            if (args.size() < 4) {
+                return RespEncoder.error("wrong number of arguments for 'lrange' command");
+            }
+            String key = args.get(1);
+            int start = Integer.parseInt(args.get(2));
+            int stop = Integer.parseInt(args.get(3));
+            List<String> elements = dataStore.lrange(key, start, stop);
+            return RespEncoder.array(elements);
+        });
+
+        // LLEN key
+        registerCommand("LLEN", (args, session) -> {
+            if (args.size() < 2) {
+                return RespEncoder.error("wrong number of arguments for 'llen' command");
+            }
+            return RespEncoder.integer(dataStore.llen(args.get(1)));
+        });
+
+        // BLPOP key [key ...] timeout
+        registerCommand("BLPOP", (args, session) -> {
+            if (args.size() < 3) {
+                return RespEncoder.error("wrong number of arguments for 'blpop' command");
+            }
+
+            // Last argument is the timeout in seconds (0 = block forever)
+            double timeoutSec = Double.parseDouble(args.get(args.size() - 1));
+            List<String> keys = args.subList(1, args.size() - 1);
+
+            // Check each key immediately — if any has data, pop and return now
+            for (String key : keys) {
+                if (dataStore.listExists(key)) {
+                    String value = dataStore.lpop(key);
+                    if (value != null) {
+                        return RespEncoder.array(List.of(key, value));
+                    }
+                }
+            }
+
+            // No data available — defer response
+            long deadline = (timeoutSec == 0)
+                    ? 0  // 0 = block indefinitely
+                    : System.currentTimeMillis() + (long) (timeoutSec * 1000);
+            pendingBlocks.add(new PendingBlock(session, new ArrayList<>(keys), deadline));
+            return new byte[0]; // No immediate response — resolved by processPendingBlocks()
+        });
     }
 }
