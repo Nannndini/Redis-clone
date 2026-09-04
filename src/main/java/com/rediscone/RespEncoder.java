@@ -75,6 +75,11 @@ public class RespEncoder {
         return "*0\r\n".getBytes(StandardCharsets.UTF_8);
     }
 
+    /** Encode a RESP Null Array: *-1\r\n */
+    public static byte[] nullArray() {
+        return "*-1\r\n".getBytes(StandardCharsets.UTF_8);
+    }
+
     /** Encode a command as a RESP Array of Bulk Strings (for sending commands to master/replica) */
     public static byte[] command(String... parts) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();

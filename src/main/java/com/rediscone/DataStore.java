@@ -71,12 +71,14 @@ public class DataStore {
     }
 
     /**
-     * Get all non-expired keys.
+     * Get all non-expired keys (string + list keys combined).
      */
     public java.util.Set<String> keys() {
         // Clean up expired keys lazily during iteration
         store.entrySet().removeIf(e -> e.getValue().isExpired());
-        return store.keySet();
+        java.util.Set<String> allKeys = new java.util.HashSet<>(store.keySet());
+        allKeys.addAll(lists.keySet());
+        return allKeys;
     }
 
     /**
@@ -180,5 +182,64 @@ public class DataStore {
     public boolean listExists(String key) {
         java.util.LinkedList<String> list = lists.get(key);
         return list != null && !list.isEmpty();
+    }
+
+    /**
+     * Pop a value from the tail (right) of a list.
+     * Removes the list if it becomes empty.
+     * @return the popped value, or null if the list doesn't exist or is empty.
+     */
+    public String rpop(String key) {
+        java.util.LinkedList<String> list = lists.get(key);
+        if (list == null || list.isEmpty()) {
+            return null;
+        }
+        String value = list.removeLast();
+        if (list.isEmpty()) {
+            lists.remove(key);
+        }
+        return value;
+    }
+
+    // ── Type introspection ──────────────────────────────────────────────
+
+    /**
+     * Get the Redis type of a key: "string", "list", or "none".
+     */
+    public String getKeyType(String key) {
+        StoreEntry entry = store.get(key);
+        if (entry != null && !entry.isExpired()) {
+            return "string";
+        }
+        if (entry != null && entry.isExpired()) {
+            store.remove(key);
+        }
+        if (listExists(key)) {
+            return "list";
+        }
+        return "none";
+    }
+
+    // ── Atomic increment ────────────────────────────────────────────────
+
+    /**
+     * Atomically increment the integer stored at key by 1.
+     * If the key does not exist, it is set to 0 before incrementing.
+     * @return the new value after incrementing.
+     * @throws NumberFormatException if the stored value is not a valid integer.
+     */
+    public long incr(String key) {
+        StoreEntry entry = store.get(key);
+        long current = 0;
+        if (entry != null) {
+            if (entry.isExpired()) {
+                store.remove(key);
+            } else {
+                current = Long.parseLong(entry.value); // throws if not a number
+            }
+        }
+        long newValue = current + 1;
+        store.put(key, new StoreEntry(String.valueOf(newValue), -1));
+        return newValue;
     }
 }
